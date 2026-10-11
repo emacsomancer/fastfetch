@@ -164,6 +164,92 @@ static bool getTerminalInfoByPidEnv(FFTerminalResult* result, const char* pidEnv
     return false;
 }
 
+static const char* getEmacsTerminalNameHint(void) {
+    const char* insideEmacs = getenv("INSIDE_EMACS");
+    if (insideEmacs == nullptr) {
+        return nullptr;
+    }
+
+    const char* frontend = strrchr(insideEmacs, ',');
+    frontend = frontend ? frontend + 1 : insideEmacs;
+
+    size_t len = strcspn(frontend, ":");
+
+    if (len == 0) {
+        return nullptr;
+    }
+    if (len == 6 && strncmp(frontend, "comint", len) == 0) {
+        return "comint";
+    }
+    if (len == 4 && strncmp(frontend, "term", len) == 0) {
+        return "term/ansi-term";
+    }
+    if (len == 6 && strncmp(frontend, "eshell", len) == 0) {
+        return "eshell";
+    }
+    if (len == 5 && strncmp(frontend, "vterm", len) == 0) {
+        return "vterm";
+    }
+    if (len == 3 && strncmp(frontend, "eat", len) == 0) {
+        return "eat";
+    }
+    if (len == 7 && strncmp(frontend, "ghostel", len) == 0) {
+        return "ghostel";
+    }
+
+    return nullptr;
+}
+
+static bool isEmacsExecutable(const char* name) {
+    return name != nullptr &&
+        (strcmp(name, "emacs") == 0 ||
+            strncmp(name, "emacs-", 6) == 0);
+}
+
+static pid_t findEmacsAncestor(pid_t pid) {
+    FFstrbuf processName, exe, exePath;
+    ffStrbufInit(&processName);
+    ffStrbufInit(&exe);
+    ffStrbufInit(&exePath);
+
+    pid_t emacsPid = 0;
+
+    for (unsigned depth = 0; pid > 1 && depth < 256; ++depth) {
+        pid_t ppid = 0;
+        const char* exeName = nullptr;
+
+        ffStrbufClear(&processName);
+        ffStrbufClear(&exe);
+        ffStrbufClear(&exePath);
+
+        if (ffProcessGetBasicInfoLinux(
+                pid, &processName, &ppid, nullptr) != nullptr) {
+            break;
+        }
+
+        ffProcessGetInfoLinux(
+            pid, &processName, &exe, &exeName, &exePath);
+
+        if (isEmacsExecutable(exeName) ||
+            isEmacsExecutable(processName.chars)) {
+            emacsPid = pid;
+            break;
+        }
+
+        if (ppid <= 0 || ppid == pid) {
+            break;
+        }
+
+        pid = ppid;
+    }
+
+    ffStrbufDestroy(&processName);
+    ffStrbufDestroy(&exe);
+    ffStrbufDestroy(&exePath);
+
+    return emacsPid;
+}
+
 static void getTerminalFromEnv(FFTerminalResult* result) {
     if (result->processName.length > 0) {
         if (!ffStrbufStartsWithS(&result->processName, "login") &&
@@ -281,6 +367,19 @@ static void getUserShellFromEnv(FFShellResult* result) {
         setExeName(&result->exe, &result->exeName);
         ffStrbufAppendS(&result->processName, result->exeName);
     }
+}
+
+static bool isEmacsEshell(void) {
+    const char* insideEmacs = getenv("INSIDE_EMACS");
+    if (insideEmacs == nullptr) {
+        return false;
+    }
+
+    const char* frontend = strrchr(insideEmacs, ',');
+    frontend = frontend ? frontend + 1 : insideEmacs;
+
+    return strncmp(frontend, "eshell", 6) == 0 &&
+        (frontend[6] == '\0' || frontend[6] == ':');
 }
 
 static void setShellInfoDetails(FFShellResult* result) {
@@ -425,11 +524,45 @@ const FFShellResult* ffDetectShell() {
         ffProcessGetBasicInfoLinux(ppid, &_, &ppid, nullptr);
     }
 
+
     ppid = getShellInfo(result, ppid);
+
+
+    /*
+     * Emacs-terminal & shell detection block
+     */
+    bool detectedProcess = result->processName.length > 0;
+    bool detectedEmacs =
+        detectedProcess &&
+        (isEmacsExecutable(result->exeName) ||
+            isEmacsExecutable(result->processName.chars));
+
+    const char* frontend = getEmacsTerminalNameHint();
+
+    /*
+     * eshell-detection-related code (& emacs-eat can also run eshell)
+     * if shell is detected to be "emacs"
+     */
+    bool emacsEshell = detectedEmacs && isEmacsEshell();
+    bool eatEshell =
+        detectedEmacs &&
+        frontend != nullptr &&
+        strcmp(frontend, "eat") == 0;
+
     getUserShellFromEnv(result);
 
     if (result->processName.length > 0) {
         setShellInfoDetails(result);
+
+        /*
+         * Eshell runs inside Emacs. Label the Emacs-hosted shell,
+         * but only if we're really in Emacs.
+         */
+        if (emacsEshell || eatEshell) {
+            ffStrbufSetS(&result->prettyName, result->exeName);
+            ffStrbufAppendS(&result->prettyName, " (eshell)");
+        }
+
         if (instance.config.general.detectVersion) {
             if (!fftsGetShellVersion(result->exePath.length > 0 ? &result->exePath : &result->exe, result->exeName, &result->version)) {
                 ffStrbufClear(&result->version);
@@ -475,18 +608,122 @@ const FFTerminalResult* ffDetectTerminal() {
     ffStrbufInit(&result->exePath);
     ffStrbufInit(&result->version);
     ffStrbufInitS(&result->tty, ttyname(STDOUT_FILENO));
+
     result->pid = 0;
     result->ppid = 0;
 
-    pid_t ppid = (pid_t) ffDetectShell()->ppid;
+    const char* emacsTerminalNameHint = getEmacsTerminalNameHint();
+    const FFShellResult* shell = ffDetectShell();
+
+    /*
+     * Determine whether this shell's ancestry includes Emacs.
+     * Nb.: this is evidence about process ancestry, *not* proof that the
+     * terminal itself is necessarily Emacs-internal.
+     */
+    pid_t emacsPid = 0;
+
+    /*
+     * For Emacs: identify a real terminal through process ancestry.
+     */
+    if (emacsTerminalNameHint != nullptr) {
+        pid_t startPid = shell->pid > 0
+            ? (pid_t) shell->pid
+            : (pid_t) shell->ppid;
+
+        emacsPid = findEmacsAncestor(startPid);
+    }
+
+    pid_t ppid = (pid_t) shell->ppid;
 
     if (ppid) {
         ppid = getTerminalInfo(result, ppid);
     }
+
     getTerminalFromEnv(result);
+
+    /*
+     * For Emacs: record if no terminal determined,
+     *  or "dumb" terminal (because eshell will report as "dumb")
+     */
+    bool noUsableTerminal =
+        result->processName.length == 0 ||
+        ffStrbufEqualS(&result->processName, "dumb");
+
+    /*
+     * For Emacs:
+     * - if we've got a hint about Emacs-internal terminal
+     *   (via INSIDE_EMACS env variable)
+     * - and Emacs is part of the process's ancestry
+     * - and fastfetch has not identified a (non-dumb) terminal otherwise
+     * Then: ultimately append the emacs-internal terminal name determined
+     *        via emacsTerminalNameHint to the terminal name "emacs";
+     *        ending up with, e.g., "Terminal: emacs (ghostel)"
+     */
+    if (emacsTerminalNameHint != nullptr &&
+        emacsPid > 0 &&
+        noUsableTerminal) {
+        pid_t emacsPpid = 0;
+
+        ffStrbufClear(&result->processName);
+        ffStrbufClear(&result->exe);
+        result->exeName = result->exe.chars;
+        ffStrbufClear(&result->exePath);
+
+        if (ffProcessGetBasicInfoLinux(
+                emacsPid,
+                &result->processName,
+                &emacsPpid,
+                nullptr) == nullptr) {
+            result->pid = (uint32_t) emacsPid;
+            result->ppid = (uint32_t) emacsPpid;
+
+            ffProcessGetInfoLinux(
+                emacsPid,
+                &result->processName,
+                &result->exe,
+                &result->exeName,
+                &result->exePath);
+        }
+    }
 
     if (result->processName.length > 0) {
         setTerminalInfoDetails(result);
+
+        /*
+         * Append an Emacs-internal "(label)" only when the detected terminal
+         * process is the Emacs process identified in the ancestry.
+         * Do *not* relabel an external terminal merely because it
+         * inherited INSIDE_EMACS: because terminal emulators launched
+         * from Emacs will inherit INSIDE_EMACS environment too.
+         */
+        bool isEmacsTerminal =
+            emacsTerminalNameHint != nullptr &&
+            emacsPid > 0 &&
+            result->pid == (uint32_t) emacsPid &&
+            (isEmacsExecutable(result->exeName) ||
+                isEmacsExecutable(result->processName.chars));
+
+        if (isEmacsTerminal) {
+            if (result->prettyName.length == 0) {
+                ffStrbufSetS(
+                    &result->prettyName,
+                    result->exeName);
+            }
+
+            ffStrbufAppendS(
+                &result->prettyName,
+                " (");
+            ffStrbufAppendS(
+                &result->prettyName,
+                emacsTerminalNameHint);
+            ffStrbufAppendC(
+                &result->prettyName,
+                ')');
+        }
+        /*
+         * end of Emacs-related terminal manipulations
+         */
+
         if (instance.config.general.detectVersion) {
             if (!fftsGetTerminalVersion(&result->processName, result->exePath.length > 0 ? &result->exePath : &result->exe, &result->version)) {
                 ffStrbufClear(&result->version);
